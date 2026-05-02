@@ -18,5 +18,5 @@ target_include_directories(weft_core INTERFACE
 )
 
 # Main executable (CLI Dashboard later)
-add_executable(weft_cli src/main.cpp src/dashboard.cpp)
+add_executable(weft_cli src/main.cpp src/dashboard.cpp src/thread_pool.cpp)
 target_link_libraries(weft_cli PRIVATE weft_core)

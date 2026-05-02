@@ -2,39 +2,49 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include "weft/task.h"
 #include "weft/metrics.h"
 #include "weft/dashboard.h"
+#include "weft/thread_pool.h"
 
 int main() {
-    // Simulate some workers for our UI test
-    weft::WorkerMetrics w0, w1, w2, w3;
-    std::vector<weft::WorkerMetrics*> workers = {&w0, &w1, &w2, &w3};
+    std::cout << "Starting Weft CLI with Global Thread Pool...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    weft::ThreadPool pool(4);
+    std::vector<weft::WorkerMetrics*> metrics = pool.get_metrics();
     
-    weft::Dashboard dashboard(workers);
+    weft::Dashboard dashboard(metrics);
     dashboard.start();
     
-    // Simulate work happening across threads to test the CLI
-    for (int i = 0; i < 30; ++i) {
-        w0.tasks_completed.fetch_add(15, std::memory_order_relaxed);
-        w0.local_queue_size.store(100 - i*3, std::memory_order_relaxed);
+    std::atomic<int> shared_counter{0};
+    const int NUM_TASKS = 2000;
+    
+    // Submit tiny tasks to the pool
+    for (int i = 0; i < NUM_TASKS; ++i) {
+        pool.submit([&shared_counter]() {
+            // Simulate variable work
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            shared_counter.fetch_add(1, std::memory_order_relaxed);
+        });
         
-        w1.tasks_completed.fetch_add(5, std::memory_order_relaxed);
-        w1.local_queue_size.store(50 - i, std::memory_order_relaxed);
-        
-        w2.successful_steals.fetch_add(1, std::memory_order_relaxed);
-        w2.tasks_completed.fetch_add(1, std::memory_order_relaxed);
-        
-        w3.successful_steals.fetch_add(2, std::memory_order_relaxed);
-        w3.tasks_completed.fetch_add(2, std::memory_order_relaxed);
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (i % 200 == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20)); // stagger submissions
+        }
     }
     
+    // Wait for tasks to complete
+    while (shared_counter.load() < NUM_TASKS) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    
+    // Keep dashboard open for a moment to see final stats
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    
     dashboard.stop();
-    // Clear screen on exit
     std::cout << "\033[2J\033[1;1H";
-    std::cout << "Weft simulation complete. Exiting.\n";
+    std::cout << "Successfully processed " << NUM_TASKS << " tasks using baseline global queue.\n";
     
     return 0;
 }
