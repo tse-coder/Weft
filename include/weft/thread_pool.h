@@ -13,8 +13,8 @@
 namespace weft {
 
 /**
- * @brief A basic thread pool using a single global queue protected by a mutex.
- * This is our unoptimized baseline.
+ * @brief Thread pool with per-thread queues and round-robin task submission.
+ * This eliminates the single global bottleneck lock.
  */
 class ThreadPool {
 public:
@@ -28,12 +28,17 @@ public:
 private:
     void worker_loop(size_t worker_id);
 
+    struct WorkerQueue {
+        std::queue<Task> queue;
+        std::mutex mutex;
+        std::condition_variable cv;
+    };
+
     std::vector<std::thread> threads_;
     std::vector<std::unique_ptr<WorkerMetrics>> metrics_;
+    std::vector<std::unique_ptr<WorkerQueue>> queues_;
 
-    std::queue<Task> global_queue_;
-    std::mutex queue_mutex_;
-    std::condition_variable condition_;
+    std::atomic<size_t> next_queue_{0};
     std::atomic<bool> stop_{false};
 };
 

@@ -5,6 +5,7 @@ namespace weft {
 ThreadPool::ThreadPool(size_t num_threads) {
     for (size_t i = 0; i < num_threads; ++i) {
         metrics_.push_back(std::make_unique<WorkerMetrics>());
+        queues_.push_back(std::make_unique<WorkerQueue>());
     }
     for (size_t i = 0; i < num_threads; ++i) {
         threads_.emplace_back(&ThreadPool::worker_loop, this, i);
@@ -13,7 +14,9 @@ ThreadPool::ThreadPool(size_t num_threads) {
 
 ThreadPool::~ThreadPool() {
     stop_ = true;
-    condition_.notify_all();
+    for (auto& q : queues_) {
+        q->cv.notify_all();
+    }
     for (auto& thread : threads_) {
         if (thread.joinable()) {
             thread.join();
@@ -22,11 +25,15 @@ ThreadPool::~ThreadPool() {
 }
 
 void ThreadPool::submit(Task task) {
+    // Round-robin submission
+    size_t q_idx = next_queue_.fetch_add(1, std::memory_order_relaxed) % queues_.size();
+    auto& target_queue = queues_[q_idx];
+    
     {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        global_queue_.push(std::move(task));
+        std::unique_lock<std::mutex> lock(target_queue->mutex);
+        target_queue->queue.push(std::move(task));
     }
-    condition_.notify_one();
+    target_queue->cv.notify_one();
 }
 
 std::vector<WorkerMetrics*> ThreadPool::get_metrics() {
@@ -39,23 +46,24 @@ std::vector<WorkerMetrics*> ThreadPool::get_metrics() {
 
 void ThreadPool::worker_loop(size_t worker_id) {
     WorkerMetrics* local_metrics = metrics_[worker_id].get();
+    auto& local_queue = queues_[worker_id];
     
     while (!stop_) {
         Task task;
         {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            condition_.wait(lock, [this] { return stop_ || !global_queue_.empty(); });
+            std::unique_lock<std::mutex> lock(local_queue->mutex);
+            local_queue->cv.wait(lock, [this, &local_queue] { 
+                return stop_ || !local_queue->queue.empty(); 
+            });
             
-            if (stop_ && global_queue_.empty()) {
+            if (stop_ && local_queue->queue.empty()) {
                 return;
             }
             
-            task = std::move(global_queue_.front());
-            global_queue_.pop();
+            task = std::move(local_queue->queue.front());
+            local_queue->queue.pop();
             
-            // For the dashboard: since it's a global queue, just report it as local queue size 
-            // for visualizing load, even though it's technically shared.
-            local_metrics->local_queue_size.store(global_queue_.size(), std::memory_order_relaxed);
+            local_metrics->local_queue_size.store(local_queue->queue.size(), std::memory_order_relaxed);
         }
         
         task();
