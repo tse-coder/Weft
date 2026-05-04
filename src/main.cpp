@@ -9,7 +9,7 @@
 #include "weft/thread_pool.h"
 
 int main() {
-    std::cout << "Starting Weft CLI with Per-Thread Queues...\n";
+    std::cout << "Starting Weft CLI with Mutex-based Work Stealing...\n";
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
     weft::ThreadPool pool(4);
