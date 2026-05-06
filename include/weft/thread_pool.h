@@ -2,9 +2,9 @@
 
 #include "weft/task.h"
 #include "weft/metrics.h"
+#include "weft/chase_lev_deque.h"
 #include <vector>
 #include <thread>
-#include <queue>
 #include <mutex>
 #include <condition_variable>
 #include <memory>
@@ -13,8 +13,8 @@
 namespace weft {
 
 /**
- * @brief Thread pool with per-thread queues and round-robin task submission.
- * This eliminates the single global bottleneck lock.
+ * @brief Fully lock-free ThreadPool.
+ * Utilizes the Chase-Lev deque for zero-contention task stealing.
  */
 class ThreadPool {
 public:
@@ -28,17 +28,21 @@ public:
 private:
     void worker_loop(size_t worker_id);
 
-    struct WorkerQueue {
-        std::queue<Task> queue;
-        std::mutex mutex;
-        std::condition_variable cv;
+    struct WorkerState {
+        WorkStealingDeque deque;
+        
+        // Used purely for parking/sleeping when completely idle to save CPU.
+        // NOT used for queue access lock.
+        std::mutex park_mutex;
+        std::condition_variable park_cv;
+        std::atomic<bool> sleeping{false};
     };
 
     std::vector<std::thread> threads_;
     std::vector<std::unique_ptr<WorkerMetrics>> metrics_;
-    std::vector<std::unique_ptr<WorkerQueue>> queues_;
+    std::vector<std::unique_ptr<WorkerState>> workers_;
 
-    std::atomic<size_t> next_queue_{0};
+    std::atomic<size_t> next_worker_{0};
     std::atomic<bool> stop_{false};
 };
 

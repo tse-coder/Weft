@@ -5,7 +5,7 @@ namespace weft {
 ThreadPool::ThreadPool(size_t num_threads) {
     for (size_t i = 0; i < num_threads; ++i) {
         metrics_.push_back(std::make_unique<WorkerMetrics>());
-        queues_.push_back(std::make_unique<WorkerQueue>());
+        workers_.push_back(std::make_unique<WorkerState>());
     }
     for (size_t i = 0; i < num_threads; ++i) {
         threads_.emplace_back(&ThreadPool::worker_loop, this, i);
@@ -14,8 +14,8 @@ ThreadPool::ThreadPool(size_t num_threads) {
 
 ThreadPool::~ThreadPool() {
     stop_ = true;
-    for (auto& q : queues_) {
-        q->cv.notify_all();
+    for (auto& w : workers_) {
+        w->park_cv.notify_all();
     }
     for (auto& thread : threads_) {
         if (thread.joinable()) {
@@ -25,14 +25,16 @@ ThreadPool::~ThreadPool() {
 }
 
 void ThreadPool::submit(Task task) {
-    size_t q_idx = next_queue_.fetch_add(1, std::memory_order_relaxed) % queues_.size();
-    auto& target_queue = queues_[q_idx];
+    size_t w_idx = next_worker_.fetch_add(1, std::memory_order_relaxed) % workers_.size();
+    auto& target_worker = workers_[w_idx];
     
-    {
-        std::unique_lock<std::mutex> lock(target_queue->mutex);
-        target_queue->queue.push(std::move(task));
+    // Completely lock-free push
+    target_worker->deque.push(std::move(task));
+    
+    // Wake up the worker if it was sleeping
+    if (target_worker->sleeping.load(std::memory_order_relaxed)) {
+        target_worker->park_cv.notify_one();
     }
-    target_queue->cv.notify_one();
 }
 
 std::vector<WorkerMetrics*> ThreadPool::get_metrics() {
@@ -45,10 +47,9 @@ std::vector<WorkerMetrics*> ThreadPool::get_metrics() {
 
 void ThreadPool::worker_loop(size_t worker_id) {
     WorkerMetrics* local_metrics = metrics_[worker_id].get();
-    auto& local_queue = queues_[worker_id];
-    size_t num_queues = queues_.size();
+    auto& local_state = workers_[worker_id];
+    size_t num_workers = workers_.size();
     
-    // Simple thread-local PRNG for victim selection
     thread_local uint32_t rng_state = worker_id + 0x1337;
     auto xorshift32 = []() -> uint32_t {
         uint32_t x = rng_state;
@@ -60,53 +61,49 @@ void ThreadPool::worker_loop(size_t worker_id) {
     };
     
     while (!stop_) {
-        Task task;
-        bool has_task = false;
+        // 1. Lock-free pop from our own bottom
+        std::optional<Task> opt_task = local_state->deque.pop();
         
-        // 1. Try local queue
-        {
-            std::unique_lock<std::mutex> lock(local_queue->mutex);
-            if (!local_queue->queue.empty()) {
-                task = std::move(local_queue->queue.front());
-                local_queue->queue.pop();
-                has_task = true;
-                local_metrics->local_queue_size.store(local_queue->queue.size(), std::memory_order_relaxed);
-            }
-        }
-        
-        // 2. Try stealing if local is empty
-        if (!has_task && num_queues > 1) {
-            local_metrics->steal_attempts.fetch_add(1, std::memory_order_relaxed);
-            size_t start_idx = xorshift32() % num_queues;
-            
-            for (size_t i = 0; i < num_queues; ++i) {
-                size_t victim_idx = (start_idx + i) % num_queues;
-                if (victim_idx == worker_id) continue;
+        if (opt_task) {
+            local_metrics->local_queue_size.store(local_state->deque.size(), std::memory_order_relaxed);
+        } else {
+            // 2. Lock-free steal from others' top
+            if (num_workers > 1) {
+                local_metrics->steal_attempts.fetch_add(1, std::memory_order_relaxed);
+                size_t start_idx = xorshift32() % num_workers;
                 
-                auto& victim_queue = queues_[victim_idx];
-                
-                // use try_lock to avoid blocking and deadlocks
-                std::unique_lock<std::mutex> lock(victim_queue->mutex, std::try_to_lock);
-                if (lock.owns_lock() && !victim_queue->queue.empty()) {
-                    task = std::move(victim_queue->queue.front());
-                    victim_queue->queue.pop();
-                    has_task = true;
-                    local_metrics->successful_steals.fetch_add(1, std::memory_order_relaxed);
-                    break;
+                for (size_t i = 0; i < num_workers; ++i) {
+                    size_t victim_idx = (start_idx + i) % num_workers;
+                    if (victim_idx == worker_id) continue;
+                    
+                    auto& victim_state = workers_[victim_idx];
+                    opt_task = victim_state->deque.steal();
+                    
+                    if (opt_task) {
+                        local_metrics->successful_steals.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
                 }
             }
         }
         
-        // 3. Execute or wait
-        if (has_task) {
-            task();
+        // 3. Execute or Park
+        if (opt_task) {
+            (*opt_task)();
             local_metrics->tasks_completed.fetch_add(1, std::memory_order_relaxed);
         } else {
-            // Wait for work on our local queue with a timeout (to occasionally re-try stealing)
-            std::unique_lock<std::mutex> lock(local_queue->mutex);
-            local_queue->cv.wait_for(lock, std::chrono::milliseconds(1), [this, &local_queue] {
-                return stop_ || !local_queue->queue.empty();
-            });
+            // No work found anywhere. Park the thread to save CPU.
+            local_state->sleeping.store(true, std::memory_order_relaxed);
+            
+            // Double check to prevent lost wakeups before sleeping
+            if (local_state->deque.size() == 0) {
+                std::unique_lock<std::mutex> lock(local_state->park_mutex);
+                local_state->park_cv.wait_for(lock, std::chrono::milliseconds(1), [this, &local_state] {
+                    return stop_ || local_state->deque.size() > 0;
+                });
+            }
+            
+            local_state->sleeping.store(false, std::memory_order_relaxed);
         }
     }
 }
