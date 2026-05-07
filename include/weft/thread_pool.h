@@ -28,7 +28,7 @@ public:
 private:
     void worker_loop(size_t worker_id);
 
-    struct WorkerState {
+    struct alignas(CACHE_LINE_SIZE) WorkerState {
         WorkStealingDeque deque;
         
         // Used purely for parking/sleeping when completely idle to save CPU.

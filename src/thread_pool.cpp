@@ -1,4 +1,5 @@
 #include "weft/thread_pool.h"
+#include <pthread.h>
 
 namespace weft {
 
@@ -46,6 +47,12 @@ std::vector<WorkerMetrics*> ThreadPool::get_metrics() {
 }
 
 void ThreadPool::worker_loop(size_t worker_id) {
+    // Pin to core to maximize cache locality and reduce context switching
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(worker_id % std::thread::hardware_concurrency(), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
     WorkerMetrics* local_metrics = metrics_[worker_id].get();
     auto& local_state = workers_[worker_id];
     size_t num_workers = workers_.size();

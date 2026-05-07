@@ -9,7 +9,7 @@
 #include "weft/thread_pool.h"
 
 int main() {
-    std::cout << "Starting Weft CLI with Lock-Free Work Stealing (Chase-Lev)...\n";
+    std::cout << "Starting Weft CLI with CPU Affinity & Hardware Optimizations...\n";
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
     weft::ThreadPool pool(4);
